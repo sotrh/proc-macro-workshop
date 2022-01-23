@@ -1,11 +1,10 @@
-use anyhow::bail;
 use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::quote;
 use syn::{
-    parse_macro_input, AngleBracketedGenericArguments, Attribute, Data, DataStruct,
-    DeriveInput, Field, GenericArgument, Meta, MetaList, MetaNameValue,
-    NestedMeta, Path, PathArguments, Type, TypePath, Lit, Ident,
+    parse_macro_input, spanned::Spanned, AngleBracketedGenericArguments, Attribute, Data,
+    DataStruct, DeriveInput, Field, GenericArgument, Ident, Lit, Meta, MetaList, MetaNameValue,
+    NestedMeta, Path, PathArguments, Type, TypePath,
 };
 
 enum FieldWrapperType<'a> {
@@ -13,7 +12,7 @@ enum FieldWrapperType<'a> {
     Option(&'a Type),
     Vec {
         inner_ty: &'a Type,
-        each: Option<String>,
+        each: Option<Result<String, syn::Error>>,
     },
 }
 
@@ -42,16 +41,20 @@ fn find_builder_attrs(f: &Field) -> Vec<&Attribute> {
         .collect::<Vec<_>>()
 }
 
-fn each_from_attribute(a: &Attribute) -> Result<String, anyhow::Error> {
+fn each_from_attribute(a: &Attribute) -> Result<String, syn::Error> {
     let meta = a.parse_meta()?;
+    let span = meta
+        .span()
+        .join(a.tokens.span())
+        .unwrap_or_else(|| meta.span());
 
-    let nested = match meta {
+    let nested = match &meta {
         Meta::List(MetaList { path, nested, .. })
             if compare_path_with_str(&path, "builder") && nested.len() == 1 =>
         {
             nested
         }
-        _ => bail!("Only builder(each = \"...\") is supported"),
+        _ => return Err(syn::Error::new(span, "expected `builder(each = \"...\")`")),
     };
 
     match &nested[0] {
@@ -60,7 +63,7 @@ fn each_from_attribute(a: &Attribute) -> Result<String, anyhow::Error> {
             lit: Lit::Str(lit),
             ..
         })) if compare_path_with_str(&nested_path, "each") => Ok(lit.value()),
-        _ => bail!("Only builder(each = \"...\") is supported"),
+        _ => return Err(syn::Error::new(span, "expected `builder(each = \"...\")`")),
     }
 }
 
@@ -79,10 +82,7 @@ pub fn derive(input: TokenStream) -> TokenStream {
     .map(|f| {
         // Process attributes
         let attrs = find_builder_attrs(f);
-        let mut each = None;
-        for a in attrs {
-            each = Some(each_from_attribute(a).unwrap());
-        }
+        let each = attrs.first().map(|a| each_from_attribute(*a));
 
         // Process wrapper types
         let segments = match f.ty {
@@ -130,7 +130,7 @@ pub fn derive(input: TokenStream) -> TokenStream {
 
             match wrapper_ty {
                 FieldWrapperType::Option(_) => quote! { #fi: #fty},
-                _ => quote! { #fi: Option<#fty> },
+                _ => quote! { #fi: std::option::Option<#fty> },
             }
         })
         .collect::<Vec<_>>();
@@ -141,10 +141,10 @@ pub fn derive(input: TokenStream) -> TokenStream {
             let fi = f.ident.clone().unwrap();
             match wrapper_ty {
                 FieldWrapperType::Vec { each: Some(_), .. } => quote! {
-                    #fi: Some(vec![])
+                    #fi: std::option::Option::Some(vec![])
                 },
                 _ => quote! {
-                    #fi: None
+                    #fi: std::option::Option::None
                 },
             }
         })
@@ -169,7 +169,8 @@ pub fn derive(input: TokenStream) -> TokenStream {
             if let Some(f_name) = &f.ident {
                 match wrapper_ty {
                     FieldWrapperType::Vec {
-                        each: Some(each), ..
+                        each: std::option::Option::Some(Ok(each)),
+                        ..
                     } if each == &f_name.to_string() => false,
                     _ => true,
                 }
@@ -206,19 +207,22 @@ pub fn derive(input: TokenStream) -> TokenStream {
                 FieldWrapperType::Vec {
                     inner_ty,
                     each: Some(each),
-                } => {
-                    let each = Ident::new(each, fi.span());
-                    quote! {
-                        pub fn #each(&mut self, val: #inner_ty) -> &mut Self {
-                            if let ::std::option::Option::Some(v) = &mut self.#fi {
-                                v.push(val);
-                            } else {
-                                self.#fi = ::std::option::Option::Some(vec![val]);
+                } => match each {
+                    Ok(each) => {
+                        let each = Ident::new(each, fi.span());
+                        quote! {
+                            pub fn #each(&mut self, val: #inner_ty) -> &mut Self {
+                                if let ::std::option::Option::Some(v) = &mut self.#fi {
+                                    v.push(val);
+                                } else {
+                                    self.#fi = ::std::option::Option::Some(vec![val]);
+                                }
+                                self
                             }
-                            self
                         }
                     }
-                }
+                    Err(e) => e.to_compile_error(),
+                },
                 _ => unreachable!(),
             }
         })
@@ -241,7 +245,7 @@ pub fn derive(input: TokenStream) -> TokenStream {
             #(#methods)*
             #(#each_methods)*
 
-            pub fn build(&self) -> Result<#st_ident, Box<dyn std::error::Error>> {
+            pub fn build(&self) -> std::result::Result<#st_ident, std::boxed::Box<dyn std::error::Error>> {
                 Ok(#st_ident {
                     #(#field_copies,)*
                 })
