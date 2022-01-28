@@ -32,26 +32,57 @@ fn compose_debug(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     };
 
     let mut generics_with_bounds = struct_generics.clone();
+    let mut associated_types = Vec::new();
     generics_with_bounds.params.iter_mut().for_each(|p| {
         match p {
             syn::GenericParam::Type(tp) => {
-                // TODO: figure out if this type is only used in
-                // std::marker::PhantomData
                 let g_ident = &tp.ident;
-                let mut is_only_phantom = false;
-                let expected = quote! {PhantomData<#g_ident>}.to_string();
+                let mut skip_bounds = false;
+
+                // This implementation is really bad and I hate it 
                 for f in &fields {
                     let ty = &f.ty;
+                    match ty {
+                        syn::Type::Path(syn::TypePath { path, .. }) => {
+                            let first = path.segments.iter().next().unwrap();
+                            match &first.arguments {
+                                syn::PathArguments::AngleBracketed(syn::AngleBracketedGenericArguments {
+                                    args,
+                                    ..
+                                }) => {
+                                    for a in args {
+                                        match a {
+                                            syn::GenericArgument::Type(syn::Type::Path(tp)) => {
+                                                let mut iter = tp.path.segments.iter();
+                                                if let Some(first) = iter.next() {
+                                                    if &first.ident == g_ident && iter.next().is_some() {
+                                                        associated_types.push(tp);
+                                                        skip_bounds = true;
+                                                    }
+                                                }
+                                            }
+                                            _ => (),
+                                        }
+                                    }
+                                }
+                                _ => ()
+                            }
+
+                        }
+                        _ => ()
+                    }
+
+                    let expected = quote! {PhantomData<#g_ident>}.to_string();
                     let actual = quote! {#ty}.to_string();
                     // TODO: this is wrong. I'm only considering the case where
                     // T is only used once.
                     if expected == actual {
-                        is_only_phantom = true;
+                        skip_bounds = true;
                         break;
                     }
                 }
 
-                if !is_only_phantom {
+                if !skip_bounds {
                     let parser = syn::Path::parse_mod_style;
                     tp.bounds.push(syn::TypeParamBound::Trait(syn::TraitBound {
                         paren_token: None,
@@ -108,13 +139,34 @@ fn compose_debug(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         field_names.push(name);
     });
 
+    let sanitized_generics = struct_generics.params.iter().map(|p| {
+        match p {
+            syn::GenericParam::Type(syn::TypeParam {
+                ident,
+                ..
+            }) => quote! { #ident },
+            _ => quote! { #p },
+        }
+    }).collect::<Vec<_>>();
+
+    let where_clause = if associated_types.len() > 0 {
+        quote! {
+            where
+                #(#associated_types: Debug,)*
+        }
+    } else {
+        quote! {}
+    };
+
     let errors = field_errors
         .into_iter()
         .map(|e| e.to_compile_error())
         .collect::<Vec<_>>();
 
-    Ok(quote! {
-        impl #generics_with_bounds std::fmt::Debug for #struct_ident #struct_generics {
+    let output = quote! {
+        impl #generics_with_bounds std::fmt::Debug for #struct_ident <#(#sanitized_generics),*>
+            #where_clause
+        {
             fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 fmt.debug_struct(#struct_name)
                     #(.field(#field_names, #field_formatters))*
@@ -123,7 +175,8 @@ fn compose_debug(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         }
 
         #(#errors)*
-    })
+    };
+    Ok(output)
 }
 
 fn path_to_string(p: &syn::Path) -> String {
