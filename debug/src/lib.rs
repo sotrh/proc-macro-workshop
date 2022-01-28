@@ -17,6 +17,8 @@ fn compose_debug(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let struct_ident = input.ident;
     let struct_name = format!("{}", struct_ident);
     let struct_generics = input.generics;
+    let struct_attrs = input.attrs;
+    let mut errors: Vec<syn::Error> = Vec::new();
 
     let fields = match input.data {
         syn::Data::Struct(syn::DataStruct {
@@ -31,74 +33,121 @@ fn compose_debug(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         }
     };
 
+    let bounds = struct_attrs
+        .iter()
+        .map(|attr| {
+            let meta = attr.parse_meta()?;
+            let span = meta
+                .span()
+                .join(attr.tokens.span())
+                .unwrap_or_else(|| meta.span());
+
+            let nested = match &meta {
+                syn::Meta::List(syn::MetaList { path, nested, .. })
+                    if path_to_string(path) == "debug" =>
+                {
+                    nested
+                }
+                _ => return Err(syn::Error::new(meta.span(), "expected `debug(bound = \"...\")`")),
+            };
+
+            match &nested[0] {
+                syn::NestedMeta::Meta(syn::Meta::NameValue(syn::MetaNameValue {
+                    path: nested_path,
+                    lit: syn::Lit::Str(lit),
+                    ..
+                })) if path_to_string(&nested_path) == "bound" => {
+                    let stream: proc_macro2::TokenStream = lit.value().parse()?;
+                    Ok(stream)
+                }
+                _ => return Err(syn::Error::new(span, "expected `debug(bound = \"...\")`")),
+            }
+        })
+        .filter_map(|r| match r {
+            Ok(b) => Some(b),
+            Err(e) => {
+                errors.push(e);
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
     let mut generics_with_bounds = struct_generics.clone();
     let mut associated_types = Vec::new();
-    generics_with_bounds.params.iter_mut().for_each(|p| {
-        match p {
-            syn::GenericParam::Type(tp) => {
-                let g_ident = &tp.ident;
-                let mut skip_bounds = false;
 
+    if bounds.is_empty() {
+        generics_with_bounds.params.iter_mut().for_each(|p| {
+            match p {
+                syn::GenericParam::Type(tp) => {
+                    let g_ident = &tp.ident;
+                    let mut skip_bounds = false;
+
+                    // This implementation is really bad and I hate it
                 // This implementation is really bad and I hate it 
-                for f in &fields {
-                    let ty = &f.ty;
-                    match ty {
-                        syn::Type::Path(syn::TypePath { path, .. }) => {
-                            let first = path.segments.iter().next().unwrap();
-                            match &first.arguments {
-                                syn::PathArguments::AngleBracketed(syn::AngleBracketedGenericArguments {
-                                    args,
-                                    ..
-                                }) => {
-                                    for a in args {
-                                        match a {
-                                            syn::GenericArgument::Type(syn::Type::Path(tp)) => {
-                                                let mut iter = tp.path.segments.iter();
-                                                if let Some(first) = iter.next() {
-                                                    if &first.ident == g_ident && iter.next().is_some() {
-                                                        associated_types.push(tp);
-                                                        skip_bounds = true;
+                    // This implementation is really bad and I hate it
+                // This implementation is really bad and I hate it 
+                    // This implementation is really bad and I hate it
+                // This implementation is really bad and I hate it 
+                    // This implementation is really bad and I hate it
+                    for f in &fields {
+                        let ty = &f.ty;
+                        match ty {
+                            syn::Type::Path(syn::TypePath { path, .. }) => {
+                                let first = path.segments.iter().next().unwrap();
+                                match &first.arguments {
+                                    syn::PathArguments::AngleBracketed(
+                                        syn::AngleBracketedGenericArguments { args, .. },
+                                    ) => {
+                                        for a in args {
+                                            match a {
+                                                syn::GenericArgument::Type(syn::Type::Path(tp)) => {
+                                                    let mut iter = tp.path.segments.iter();
+                                                    if let Some(first) = iter.next() {
+                                                        if &first.ident == g_ident
+                                                            && iter.next().is_some()
+                                                        {
+                                                            associated_types.push(tp);
+                                                            skip_bounds = true;
+                                                        }
                                                     }
                                                 }
+                                                _ => (),
                                             }
-                                            _ => (),
                                         }
                                     }
+                                    _ => (),
                                 }
-                                _ => ()
                             }
-
+                            _ => (),
                         }
-                        _ => ()
+
+                        let expected = quote! {PhantomData<#g_ident>}.to_string();
+                        let actual = quote! {#ty}.to_string();
+                        // TODO: this is wrong. I'm only considering the case where
+                        // T is only used once.
+                        if expected == actual {
+                            skip_bounds = true;
+                            break;
+                        }
                     }
 
-                    let expected = quote! {PhantomData<#g_ident>}.to_string();
-                    let actual = quote! {#ty}.to_string();
-                    // TODO: this is wrong. I'm only considering the case where
-                    // T is only used once.
-                    if expected == actual {
-                        skip_bounds = true;
-                        break;
+                    if !skip_bounds {
+                        let parser = syn::Path::parse_mod_style;
+                        tp.bounds.push(syn::TypeParamBound::Trait(syn::TraitBound {
+                            paren_token: None,
+                            modifier: syn::TraitBoundModifier::None,
+                            lifetimes: None,
+                            path: parser.parse_str("std::fmt::Debug").unwrap(),
+                        }));
                     }
                 }
-
-                if !skip_bounds {
-                    let parser = syn::Path::parse_mod_style;
-                    tp.bounds.push(syn::TypeParamBound::Trait(syn::TraitBound {
-                        paren_token: None,
-                        modifier: syn::TraitBoundModifier::None,
-                        lifetimes: None,
-                        path: parser.parse_str("std::fmt::Debug").unwrap(),
-                    }));
-                }
+                _ => todo!(),
             }
-            _ => todo!(),
-        }
-    });
+        });
+    }
 
     let mut field_formatters = Vec::with_capacity(fields.len());
     let mut field_names = Vec::with_capacity(fields.len());
-    let mut field_errors = Vec::new();
 
     fields.iter().for_each(|f| {
         let ident = f.ident.clone().unwrap();
@@ -122,7 +171,7 @@ fn compose_debug(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             .filter_map(|a| match a {
                 Ok(a) => Some(a),
                 Err(e) => {
-                    field_errors.push(e);
+                    errors.push(e);
                     None
                 }
             })
@@ -139,17 +188,21 @@ fn compose_debug(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         field_names.push(name);
     });
 
-    let sanitized_generics = struct_generics.params.iter().map(|p| {
-        match p {
-            syn::GenericParam::Type(syn::TypeParam {
-                ident,
-                ..
-            }) => quote! { #ident },
+    let sanitized_generics = struct_generics
+        .params
+        .iter()
+        .map(|p| match p {
+            syn::GenericParam::Type(syn::TypeParam { ident, .. }) => quote! { #ident },
             _ => quote! { #p },
-        }
-    }).collect::<Vec<_>>();
+        })
+        .collect::<Vec<_>>();
 
-    let where_clause = if associated_types.len() > 0 {
+    let where_clause = if bounds.len() > 0 {
+        quote! {
+            where
+                #(#bounds)*
+        }
+    } else if associated_types.len() > 0 {
         quote! {
             where
                 #(#associated_types: Debug,)*
@@ -158,7 +211,7 @@ fn compose_debug(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         quote! {}
     };
 
-    let errors = field_errors
+    let errors = errors
         .into_iter()
         .map(|e| e.to_compile_error())
         .collect::<Vec<_>>();

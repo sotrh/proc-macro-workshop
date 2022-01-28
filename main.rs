@@ -1,23 +1,31 @@
-// This test case covers one more heuristic that is often worth incorporating
-// into derive macros that infer trait bounds. Here we look for the use of an
-// associated type of a type parameter.
+// There are some cases where no heuristic would be sufficient to infer the
+// right trait bounds based only on the information available during macro
+// expansion.
 //
-// The generated impl will need to look like:
+// When this happens, we'll turn to attributes as a way for the caller to
+// handwrite the correct trait bounds themselves.
 //
-//     impl<T: Trait> Debug for Field<T>
+// The impl for Wrapper<T> in the code below will need to include the bounds
+// provided in the `debug(bound = "...")` attribute. When such an attribute is
+// present, also disable all inference of bounds so that the macro does not
+// attach its own `T: Debug` inferred bound.
+//
+//     impl<T: Trait> Debug for Wrapper<T>
 //     where
 //         T::Value: Debug,
 //     {...}
 //
-// You can identify associated types as any syn::TypePath in which the first
-// path segment is one of the type parameters and there is more than one
-// segment.
+// Optionally, though this is not covered by the test suite, also accept
+// `debug(bound = "...")` attributes on individual fields. This should
+// substitute only whatever bounds are inferred based on that field's type,
+// without removing bounds inferred based on the other fields:
 //
-//
-// Resources:
-//
-//   - The relevant types in the input will be represented in this syntax tree
-//     node: https://docs.rs/syn/1.0/syn/struct.TypePath.html
+//     #[derive(CustomDebug)]
+//     pub struct Wrapper<T: Trait, U> {
+//         #[debug(bound = "T::Value: Debug")]
+//         field: Field<T>,
+//         normal: U,
+//     }
 
 use derive_debug::CustomDebug;
 use std::fmt::Debug;
@@ -27,19 +35,24 @@ pub trait Trait {
 }
 
 #[derive(CustomDebug)]
-pub struct Field<T: Trait> {
+#[debug(bound = "T::Value: Debug")]
+pub struct Wrapper<T: Trait> {
+    field: Field<T>,
+}
+
+#[derive(CustomDebug)]
+struct Field<T: Trait> {
     values: Vec<T::Value>,
 }
 
 fn assert_debug<F: Debug>() {}
 
 fn main() {
-    // Does not implement Debug, but its associated type does.
     struct Id;
 
     impl Trait for Id {
         type Value = u8;
     }
 
-    assert_debug::<Field<Id>>();
+    assert_debug::<Wrapper<Id>>();
 }
