@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, spanned::Spanned, DeriveInput, Field};
+use syn::{parse::Parser, parse_macro_input, spanned::Spanned, DeriveInput};
 
 #[proc_macro_derive(CustomDebug, attributes(debug))]
 pub fn derive(input: TokenStream) -> TokenStream {
@@ -13,20 +13,57 @@ pub fn derive(input: TokenStream) -> TokenStream {
 }
 
 fn compose_debug(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
-    let struct_ident = &input.ident;
+    let struct_span = input.span();
+    let struct_ident = input.ident;
     let struct_name = format!("{}", struct_ident);
-    let fields = match &input.data {
+    let struct_generics = input.generics;
+
+    let fields = match input.data {
         syn::Data::Struct(syn::DataStruct {
             fields: syn::Fields::Named(syn::FieldsNamed { named: fields, .. }),
             ..
         }) => fields,
         _ => {
             return Err(syn::Error::new(
-                input.span(),
+                struct_span,
                 "CustomDebug is only implemented for structs",
             ))
         }
     };
+
+    let mut generics_with_bounds = struct_generics.clone();
+    generics_with_bounds.params.iter_mut().for_each(|p| {
+        match p {
+            syn::GenericParam::Type(tp) => {
+                // TODO: figure out if this type is only used in
+                // std::marker::PhantomData
+                let g_ident = &tp.ident;
+                let mut is_only_phantom = false;
+                let expected = quote! {PhantomData<#g_ident>}.to_string();
+                for f in &fields {
+                    let ty = &f.ty;
+                    let actual = quote! {#ty}.to_string();
+                    // TODO: this is wrong. I'm only considering the case where
+                    // T is only used once.
+                    if expected == actual {
+                        is_only_phantom = true;
+                        break;
+                    }
+                }
+
+                if !is_only_phantom {
+                    let parser = syn::Path::parse_mod_style;
+                    tp.bounds.push(syn::TypeParamBound::Trait(syn::TraitBound {
+                        paren_token: None,
+                        modifier: syn::TraitBoundModifier::None,
+                        lifetimes: None,
+                        path: parser.parse_str("std::fmt::Debug").unwrap(),
+                    }));
+                }
+            }
+            _ => todo!(),
+        }
+    });
 
     let mut field_formatters = Vec::with_capacity(fields.len());
     let mut field_names = Vec::with_capacity(fields.len());
@@ -41,8 +78,6 @@ fn compose_debug(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             .map(|a| {
                 let meta = a.parse_meta()?;
                 let span = meta.span();
-
-                eprintln!("{:?}", meta);
 
                 match meta {
                     syn::Meta::NameValue(syn::MetaNameValue {
@@ -64,9 +99,9 @@ fn compose_debug(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 
         let name = format!("{}", ident);
         let formatter = if let Some(debug) = attrs.first() {
-            quote!{ &format_args!(#debug, &self.#ident) }
+            quote! { &format_args!(#debug, &self.#ident) }
         } else {
-            quote!{ &self.#ident }
+            quote! { &self.#ident }
         };
 
         field_formatters.push(formatter);
@@ -79,7 +114,7 @@ fn compose_debug(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         .collect::<Vec<_>>();
 
     Ok(quote! {
-        impl std::fmt::Debug for #struct_ident {
+        impl #generics_with_bounds std::fmt::Debug for #struct_ident #struct_generics {
             fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 fmt.debug_struct(#struct_name)
                     #(.field(#field_names, #field_formatters))*
